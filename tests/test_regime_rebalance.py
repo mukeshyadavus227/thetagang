@@ -1,5 +1,5 @@
 import math
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
@@ -16,6 +16,13 @@ from thetagang.legacy_config import (
     normalize_config,
 )
 from thetagang.portfolio_manager import PortfolioManager
+from thetagang.strategies.regime_engine import (
+    REGIME_HISTORY_MAX_ATTEMPTS,
+    REGIME_HISTORY_TIMEFRAME,
+)
+
+REGIME_HISTORY_START = datetime(2024, 1, 2)
+REGIME_SYMBOLS = ("AAA", "BBB")
 
 
 @pytest.fixture
@@ -157,11 +164,8 @@ def _freeze_now(monkeypatch, fixed: datetime) -> None:
 
 
 def _mock_regime_history(portfolio_manager, mocker, closes):
-    start_date = datetime(2024, 1, 2)
-    bars = [
-        SimpleNamespace(date=start_date + timedelta(days=offset), close=close)
-        for offset, close in enumerate(closes)
-    ]
+    bars = _regime_bars(closes)
+    _mock_required_regime_history_dates(portfolio_manager, mocker)
 
     async def _get_history(*_args, **_kwargs):
         return bars
@@ -172,15 +176,18 @@ def _mock_regime_history(portfolio_manager, mocker, closes):
     return bars
 
 
+def _regime_bars(closes, start_date: datetime = REGIME_HISTORY_START):
+    return [
+        SimpleNamespace(date=start_date + timedelta(days=offset), close=close)
+        for offset, close in enumerate(closes)
+    ]
+
+
 def _mock_regime_histories(portfolio_manager, mocker, closes_by_symbol):
-    start_date = datetime(2024, 1, 2)
     bars_by_symbol = {
-        symbol: [
-            SimpleNamespace(date=start_date + timedelta(days=offset), close=close)
-            for offset, close in enumerate(closes)
-        ]
-        for symbol, closes in closes_by_symbol.items()
+        symbol: _regime_bars(closes) for symbol, closes in closes_by_symbol.items()
     }
+    _mock_required_regime_history_dates(portfolio_manager, mocker)
 
     async def _get_history(contract, *_args, **_kwargs):
         return bars_by_symbol[contract.symbol]
@@ -216,12 +223,77 @@ def _mock_regime_tickers(
     )
 
 
+def _mock_regime_broker(portfolio_manager, mocker, **history_mock_kwargs) -> None:
+    _mock_regime_tickers(portfolio_manager, mocker)
+    portfolio_manager.ibkr.request_historical_data = mocker.AsyncMock(
+        **history_mock_kwargs
+    )
+    portfolio_manager.ibkr.request_executions = mocker.AsyncMock(return_value=[])
+
+
 def _stock_position(symbol: str, position: int, market_value: float | None = None):
     return SimpleNamespace(
         contract=Stock(symbol, "SMART", "USD"),
         position=position,
         marketValue=market_value,
     )
+
+
+def _regime_account_summary(value: str = "400"):
+    return {"NetLiquidation": SimpleNamespace(value=value)}
+
+
+def _regime_stock_positions(aaa: int = 3, bbb: int = 1):
+    return {
+        "AAA": [_stock_position("AAA", aaa)],
+        "BBB": [_stock_position("BBB", bbb)],
+    }
+
+
+def _expected_regime_history_fetches(symbols=REGIME_SYMBOLS) -> int:
+    return len(symbols) * REGIME_HISTORY_MAX_ATTEMPTS
+
+
+def _disable_regime_history_retry_delay(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "thetagang.strategies.regime_engine.REGIME_HISTORY_RETRY_DELAY_SECONDS",
+        0.0,
+    )
+
+
+def _required_regime_history_dates(required_points: int) -> list[date]:
+    return [
+        (REGIME_HISTORY_START + timedelta(days=offset)).date()
+        for offset in range(required_points)
+    ]
+
+
+def _set_required_regime_history_dates(
+    portfolio_manager, monkeypatch, required_points: int
+) -> list[date]:
+    required_dates = _required_regime_history_dates(required_points)
+    monkeypatch.setattr(
+        portfolio_manager.regime_engine,
+        "_get_required_history_dates",
+        lambda _required_points: required_dates,
+    )
+    return required_dates
+
+
+def _mock_required_regime_history_dates(portfolio_manager, mocker) -> None:
+    mocker.patch.object(
+        portfolio_manager.regime_engine,
+        "_get_required_history_dates",
+        side_effect=_required_regime_history_dates,
+    )
+
+
+def _seed_regime_history_cache(portfolio_manager, closes, symbols=REGIME_SYMBOLS):
+    cache_bars = _regime_bars(closes)
+    for symbol in symbols:
+        portfolio_manager.data_store.record_historical_bars(
+            symbol, REGIME_HISTORY_TIMEFRAME, cache_bars
+        )
 
 
 def _option_position(
@@ -310,6 +382,23 @@ def _ratio_gate_config(
     )
 
 
+def _configure_flow_rebalance(
+    portfolio_manager,
+    *,
+    choppiness_min: float = 0.0,
+    efficiency_max: float = 1.0,
+    flow_trade_min: float = 0.10,
+    flow_trade_stop: float = 0.05,
+) -> None:
+    regime_rebalance = portfolio_manager.config.strategies.regime_rebalance
+    regime_rebalance.soft_band = 0.50
+    regime_rebalance.hard_band = 0.80
+    regime_rebalance.choppiness_min = choppiness_min
+    regime_rebalance.efficiency_max = efficiency_max
+    regime_rebalance.flow_trade_min = flow_trade_min
+    regime_rebalance.flow_trade_stop = flow_trade_stop
+
+
 @pytest.mark.asyncio
 async def test_regime_rebalance_generates_orders(portfolio_manager, mocker):
     account_summary = {"NetLiquidation": SimpleNamespace(value="400")}
@@ -328,6 +417,172 @@ async def test_regime_rebalance_generates_orders(portfolio_manager, mocker):
     )
 
     assert orders == [("AAA", "NYSE", -1), ("BBB", "NYSE", 1)]
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_retries_empty_history(
+    portfolio_manager, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    _mock_required_regime_history_dates(portfolio_manager, mocker)
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+    bars = _regime_bars([100.0, 110.0, 100.0, 110.0])
+    attempts_by_symbol = {"AAA": 0, "BBB": 0}
+
+    async def _get_history(contract, *_args, **_kwargs):
+        attempts_by_symbol[contract.symbol] += 1
+        if attempts_by_symbol[contract.symbol] == 1:
+            return []
+        return bars
+
+    _mock_regime_broker(portfolio_manager, mocker, side_effect=_get_history)
+
+    _, orders = await portfolio_manager.check_regime_rebalance_positions(
+        account_summary, portfolio_positions
+    )
+
+    assert attempts_by_symbol == {"AAA": 2, "BBB": 2}
+    assert orders == [("AAA", "NYSE", -1), ("BBB", "NYSE", 1)]
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_uses_fresh_cached_history_when_api_empty(
+    portfolio_manager_with_db, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    _set_required_regime_history_dates(
+        portfolio_manager_with_db, monkeypatch, required_points=4
+    )
+    _seed_regime_history_cache(portfolio_manager_with_db, [100.0, 110.0, 100.0, 110.0])
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+
+    _mock_regime_broker(portfolio_manager_with_db, mocker, return_value=[])
+
+    _, orders = await portfolio_manager_with_db.check_regime_rebalance_positions(
+        account_summary, portfolio_positions
+    )
+
+    assert (
+        portfolio_manager_with_db.ibkr.request_historical_data.call_count
+        == _expected_regime_history_fetches()
+    )
+    assert orders == [("AAA", "NYSE", -1), ("BBB", "NYSE", 1)]
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_uses_fresh_cache_when_api_history_is_stale(
+    portfolio_manager_with_db, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    _set_required_regime_history_dates(
+        portfolio_manager_with_db, monkeypatch, required_points=4
+    )
+    _seed_regime_history_cache(portfolio_manager_with_db, [100.0, 110.0, 100.0, 110.0])
+    stale_bars = _regime_bars(
+        [100.0, 99.0, 98.0, 97.0],
+        start_date=datetime(2023, 12, 20),
+    )
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+
+    _mock_regime_broker(portfolio_manager_with_db, mocker, return_value=stale_bars)
+
+    _, orders = await portfolio_manager_with_db.check_regime_rebalance_positions(
+        account_summary, portfolio_positions
+    )
+
+    assert portfolio_manager_with_db.ibkr.request_historical_data.call_count == len(
+        REGIME_SYMBOLS
+    )
+    assert orders == [("AAA", "NYSE", -1), ("BBB", "NYSE", 1)]
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_ignores_history_after_required_sessions(
+    portfolio_manager, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    required_dates = _set_required_regime_history_dates(
+        portfolio_manager, monkeypatch, required_points=4
+    )
+    bars_with_extra_partial_session = _regime_bars([100.0, 110.0, 100.0, 110.0, 1.0])
+
+    _mock_regime_broker(
+        portfolio_manager, mocker, return_value=bars_with_extra_partial_session
+    )
+
+    (
+        dates,
+        aligned_closes,
+    ) = await portfolio_manager.regime_engine._get_regime_aligned_closes(
+        list(REGIME_SYMBOLS),
+        lookback_days=3,
+        cooldown_days=0,
+    )
+
+    assert dates == required_dates
+    assert aligned_closes == {
+        "AAA": [100.0, 110.0, 100.0, 110.0],
+        "BBB": [100.0, 110.0, 100.0, 110.0],
+    }
+    assert portfolio_manager.ibkr.request_historical_data.call_count == len(
+        REGIME_SYMBOLS
+    )
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_rejects_incomplete_cached_history(
+    portfolio_manager_with_db, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    _set_required_regime_history_dates(
+        portfolio_manager_with_db, monkeypatch, required_points=4
+    )
+    _seed_regime_history_cache(portfolio_manager_with_db, [100.0, 110.0, 100.0])
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+
+    _mock_regime_broker(portfolio_manager_with_db, mocker, return_value=[])
+
+    with pytest.raises(ValueError, match="fresh historical data"):
+        await portfolio_manager_with_db.check_regime_rebalance_positions(
+            account_summary, portfolio_positions
+        )
+
+    assert (
+        portfolio_manager_with_db.ibkr.request_historical_data.call_count
+        == _expected_regime_history_fetches()
+    )
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_rejects_unreadable_cached_history(
+    portfolio_manager_with_db, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    _set_required_regime_history_dates(
+        portfolio_manager_with_db, monkeypatch, required_points=4
+    )
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+
+    _mock_regime_broker(portfolio_manager_with_db, mocker, return_value=[])
+    portfolio_manager_with_db.data_store.get_historical_bars = mocker.Mock(
+        side_effect=RuntimeError("database unavailable")
+    )
+
+    with pytest.raises(ValueError, match="readable history cache"):
+        await portfolio_manager_with_db.check_regime_rebalance_positions(
+            account_summary, portfolio_positions
+        )
+
+    assert (
+        portfolio_manager_with_db.ibkr.request_historical_data.call_count
+        == _expected_regime_history_fetches()
+    )
+    assert portfolio_manager_with_db.data_store.get_historical_bars.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -1375,7 +1630,7 @@ async def test_regime_rebalance_insufficient_history(portfolio_manager, mocker):
     _mock_regime_history(portfolio_manager, mocker, [100.0, 110.0, 100.0])
     portfolio_manager.ibkr.request_executions = mocker.AsyncMock(return_value=[])
 
-    with pytest.raises(ValueError, match="full lookback history"):
+    with pytest.raises(ValueError, match="fresh historical data"):
         await portfolio_manager.check_regime_rebalance_positions(
             account_summary, portfolio_positions
         )
@@ -1505,23 +1760,19 @@ async def test_regime_rebalance_soft_band_blocked_by_regime(portfolio_manager, m
 
 
 @pytest.mark.asyncio
-async def test_regime_rebalance_flow_trades_ignore_regime_gate(
+async def test_regime_rebalance_flow_trades_require_regime_gate(
     portfolio_manager, mocker
 ):
-    portfolio_manager.config.strategies.regime_rebalance.soft_band = 0.50
-    portfolio_manager.config.strategies.regime_rebalance.hard_band = 0.80
-    portfolio_manager.config.strategies.regime_rebalance.choppiness_min = 10.0
-    portfolio_manager.config.strategies.regime_rebalance.efficiency_max = 0.01
-    portfolio_manager.config.strategies.regime_rebalance.flow_trade_min = 0.10
-    portfolio_manager.config.strategies.regime_rebalance.flow_trade_stop = 0.05
-    portfolio_manager.config.strategies.regime_rebalance.ratio_gate = (
-        _ratio_gate_config(vol_min=0.05)
+    _configure_flow_rebalance(
+        portfolio_manager,
+        choppiness_min=10.0,
+        efficiency_max=0.01,
     )
 
     account_summary = {"NetLiquidation": SimpleNamespace(value="2000")}
     portfolio_positions = {
-        "AAA": [SimpleNamespace(contract=Stock("AAA", "SMART", "USD"), position=8)],
-        "BBB": [SimpleNamespace(contract=Stock("BBB", "SMART", "USD"), position=8)],
+        "AAA": [_stock_position("AAA", 8)],
+        "BBB": [_stock_position("BBB", 8)],
     }
 
     _mock_regime_tickers(portfolio_manager, mocker, aaa_price=100.0, bbb_price=100.0)
@@ -1532,7 +1783,95 @@ async def test_regime_rebalance_flow_trades_ignore_regime_gate(
         account_summary, portfolio_positions
     )
 
-    assert orders == [("AAA", "NYSE", 2), ("BBB", "NYSE", 2)]
+    assert orders == []
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_ratio_gate_blocks_flow_rebalance(
+    portfolio_manager, mocker
+):
+    _configure_flow_rebalance(portfolio_manager)
+    portfolio_manager.config.strategies.regime_rebalance.ratio_gate = (
+        _ratio_gate_config(vol_min=0.05)
+    )
+
+    account_summary = {"NetLiquidation": SimpleNamespace(value="2000")}
+    portfolio_positions = {
+        "AAA": [_stock_position("AAA", 8)],
+        "BBB": [_stock_position("BBB", 8)],
+    }
+
+    _mock_regime_tickers(portfolio_manager, mocker, aaa_price=100.0, bbb_price=100.0)
+    _mock_regime_history(portfolio_manager, mocker, [100.0, 110.0, 100.0, 110.0])
+    portfolio_manager.ibkr.request_executions = mocker.AsyncMock(return_value=[])
+
+    _, orders = await portfolio_manager.check_regime_rebalance_positions(
+        account_summary, portfolio_positions
+    )
+
+    assert orders == []
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_blocked_flow_preserves_hysteresis(
+    portfolio_manager_with_db, mocker
+):
+    _configure_flow_rebalance(
+        portfolio_manager_with_db,
+        flow_trade_min=0.25,
+        flow_trade_stop=0.05,
+    )
+    portfolio_manager_with_db.config.strategies.regime_rebalance.ratio_gate = (
+        _ratio_gate_config(vol_min=0.05)
+    )
+
+    account_summary = {"NetLiquidation": SimpleNamespace(value="2000")}
+
+    _mock_regime_tickers(
+        portfolio_manager_with_db,
+        mocker,
+        aaa_price=100.0,
+        bbb_price=100.0,
+    )
+    _mock_regime_history(
+        portfolio_manager_with_db,
+        mocker,
+        [100.0, 110.0, 100.0, 110.0],
+    )
+    portfolio_manager_with_db.ibkr.request_executions = mocker.AsyncMock(
+        return_value=[]
+    )
+
+    (
+        _,
+        blocked_orders,
+    ) = await portfolio_manager_with_db.check_regime_rebalance_positions(
+        account_summary,
+        {
+            "AAA": [_stock_position("AAA", 7)],
+            "BBB": [_stock_position("BBB", 7)],
+        },
+    )
+
+    assert blocked_orders == []
+    assert portfolio_manager_with_db.data_store.get_last_event_payload(
+        "regime_rebalance_state"
+    ) == {"flow_active": True, "deficit_active": False}
+
+    portfolio_manager_with_db.config.strategies.regime_rebalance.ratio_gate = None
+
+    (
+        _,
+        resumed_orders,
+    ) = await portfolio_manager_with_db.check_regime_rebalance_positions(
+        account_summary,
+        {
+            "AAA": [_stock_position("AAA", 8)],
+            "BBB": [_stock_position("BBB", 8)],
+        },
+    )
+
+    assert resumed_orders == [("AAA", "NYSE", 2), ("BBB", "NYSE", 2)]
 
 
 def test_normalize_config_converts_parts_to_weights():
@@ -2020,6 +2359,27 @@ async def test_regime_rebalance_no_common_dates_raises(portfolio_manager, mocker
         await portfolio_manager.check_regime_rebalance_positions(
             account_summary, portfolio_positions
         )
+
+
+@pytest.mark.asyncio
+async def test_regime_rebalance_empty_history_stays_hard_failure(
+    portfolio_manager, mocker, monkeypatch
+):
+    _disable_regime_history_retry_delay(monkeypatch)
+    account_summary = _regime_account_summary()
+    portfolio_positions = _regime_stock_positions()
+
+    _mock_regime_broker(portfolio_manager, mocker, return_value=[])
+
+    with pytest.raises(ValueError, match="aligned history"):
+        await portfolio_manager.check_regime_rebalance_positions(
+            account_summary, portfolio_positions
+        )
+
+    assert (
+        portfolio_manager.ibkr.request_historical_data.call_count
+        == _expected_regime_history_fetches()
+    )
 
 
 @pytest.mark.asyncio
