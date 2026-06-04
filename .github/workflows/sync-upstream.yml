@@ -3,7 +3,7 @@ name: Sync fork with upstream
 on:
   schedule:
     # Runs daily at 06:00 UTC (adjust cron expression as needed)
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'→ Runs at 06:00
   workflow_dispatch:  # Allows manual trigger from the Actions tab
 
 jobs:
@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
